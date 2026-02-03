@@ -7,6 +7,7 @@ pub mod viribinpack;
 
 pub use direct::{CanBeDirectlySequentiallyLoaded, DirectSequentialDataLoader};
 pub use montybinpack::MontyBinpackLoader;
+pub(crate) use rng::SimpleRand;
 pub use sfbinpack::SfBinpackLoader;
 pub use text::InMemoryTextLoader;
 pub use viribinpack::ViriBinpackLoader;

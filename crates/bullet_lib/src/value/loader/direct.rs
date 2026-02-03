@@ -6,7 +6,7 @@ use std::{
     slice,
 };
 
-use super::DataLoader;
+use super::{DataLoader, SimpleRand};
 
 /// ### Safety
 /// This indicates that the type can be validly transmuted from
@@ -16,6 +16,7 @@ pub unsafe trait CanBeDirectlySequentiallyLoaded: Copy + 'static {}
 #[derive(Clone)]
 pub struct DirectSequentialDataLoader {
     file_paths: Vec<String>,
+    random_fen_skipping: u32,
 }
 
 impl DirectSequentialDataLoader {
@@ -27,7 +28,15 @@ impl DirectSequentialDataLoader {
             assert!(path_buf.exists(), "File not found: {path}");
         }
 
-        Self { file_paths }
+        Self { file_paths, random_fen_skipping: 0 }
+    }
+
+    /// Set random FEN skipping.
+    /// `n` means on average skip `n` positions before using one.
+    /// For example, n=3 means use 1 out of every 4 positions (1/(n+1) probability).
+    pub fn with_random_fen_skipping(mut self, n: u32) -> Self {
+        self.random_fen_skipping = n;
+        self
     }
 
     pub fn map_file_sizes<F: FnMut(&str, u64)>(&self, mut f: F) {
@@ -95,6 +104,9 @@ impl<T: CanBeDirectlySequentiallyLoaded> DataLoader<T> for DirectSequentialDataL
 
         let mut buf = unsafe { zeroed_boxed_slice::<T>(cap) };
 
+        // Initialize RNG for random-fen-skipping
+        let mut rng = SimpleRand::with_seed();
+
         'dataloading: loop {
             let mut loader_files = vec![];
             for file in file_paths.iter() {
@@ -124,7 +136,28 @@ impl<T: CanBeDirectlySequentiallyLoaded> DataLoader<T> for DirectSequentialDataL
                     let len = count / size_of::<T>();
 
                     for batch in buf[..len].chunks(batch_size) {
-                        let should_break = f(batch);
+                        // Apply filtering if random fen skipping is enabled
+                        let should_break = if self.random_fen_skipping > 0 {
+                            // Filter positions based on random skipping setting
+                            let filtered: Vec<T> = batch
+                                .iter()
+                                .filter(|_| {
+                                    // Random-fen-skipping: use 1/(n+1) of positions
+                                    let rand_val = (rng.rng() % (self.random_fen_skipping as u64 + 1)) as u32;
+                                    rand_val == 0
+                                })
+                                .copied()
+                                .collect();
+
+                            // Only pass non-empty batches
+                            if filtered.is_empty() {
+                                false
+                            } else {
+                                f(&filtered)
+                            }
+                        } else {
+                            f(batch)
+                        };
 
                         if should_break {
                             break 'dataloading;

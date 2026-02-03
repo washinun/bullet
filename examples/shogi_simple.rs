@@ -5,27 +5,29 @@ Usage:
     cargo run --release --example shogi_simple -- [OPTIONS]
 
 Options:
-    --arch <ARCH>       Architecture preset (default: 256x2-32-32)
-                        Presets: 256x2-32-32, 512x2-8-96, 512x2-32-32, 1024x2-8-32
-    --l1 <SIZE>         L1 (accumulator) size (overrides preset)
-    --l2 <SIZE>         L2 (hidden layer 1) size
-    --l3 <SIZE>         L3 (hidden layer 2) size
-    --data <PATH>       Training data path (comma-separated for multiple files)
-    --batch-size <N>    Batch size (default: 16384)
-    --superbatches <N>  Number of superbatches (default: 100)
-    --lr <RATE>         Initial learning rate (default: 0.001)
-    --wdl <LAMBDA>      WDL lambda (default: 0.75)
-    --scale <N>         Eval scale (default: 1020)
-                        FV_SCALE = QA*QB/scale (rounded)
-                        QA=255 (SCReLU): 16320/scale -> 510->32, 1020->16
-                        QA=127 (CReLU):  8128/scale  -> 508->16, 254->32
-                        Note: Default (QA=255, scale=1020) -> FV_SCALE=16
-                        For FV_SCALE=32: --qa 255 --scale 510 or --qa 127 --scale 254
-    --save-rate <N>     Save interval in superbatches (default: 10)
-    --threads <N>       Number of threads (default: 4)
-    --output <DIR>      Output directory (default: checkpoints)
-    --net-id <NAME>     Network ID (default: shogi-halfka-hm)
-    --weight-decay <F>  Weight decay (default: 0.01)
+    --arch <ARCH>                Architecture preset (default: 256x2-32-32)
+                                 Presets: 256x2-32-32, 512x2-8-96, 512x2-32-32, 1024x2-8-32
+    --l1 <SIZE>                  L1 (accumulator) size (overrides preset)
+    --l2 <SIZE>                  L2 (hidden layer 1) size
+    --l3 <SIZE>                  L3 (hidden layer 2) size
+    --data <PATH>                Training data path (comma-separated for multiple files)
+    --batch-size <N>             Batch size (default: 16384)
+    --superbatches <N>           Number of superbatches (default: 100)
+    --lr <RATE>                  Initial learning rate (default: 0.001)
+    --wdl <LAMBDA>               WDL lambda (default: 0.75)
+    --scale <N>                  Eval scale (default: 1020)
+                                 FV_SCALE = QA*QB/scale (rounded)
+                                 QA=255 (SCReLU): 16320/scale -> 510->32, 1020->16
+                                 QA=127 (CReLU):  8128/scale  -> 508->16, 254->32
+                                 Note: Default (QA=255, scale=1020) -> FV_SCALE=16
+                                 For FV_SCALE=32: --qa 255 --scale 510 or --qa 127 --scale 254
+    --save-rate <N>              Save interval in superbatches (default: 10)
+    --threads <N>                Number of threads (default: 4)
+    --output <DIR>               Output directory (default: checkpoints)
+    --net-id <NAME>              Network ID (default: shogi-halfka-hm)
+    --weight-decay <F>           Weight decay (default: 0.01)
+    --random-fen-skipping <N>    Skip fens randomly, use 1 of every (N+1) positions (default: 0)
+    --early-fen-skipping <N>     Skip positions with ply < N (default: 0)
 
 Examples:
     # Train with default settings
@@ -36,6 +38,9 @@ Examples:
 
     # Train with custom sizes
     cargo run --release --example shogi_simple -- --l1 1024 --l2 16 --l3 64 --data data/train.bin
+
+    # Train with random fen skipping (use 1/4 of positions) and skip first 16 plies
+    cargo run --release --example shogi_simple -- --data data/train.bin --random-fen-skipping 3 --early-fen-skipping 16
 */
 
 use std::path::PathBuf;
@@ -43,12 +48,13 @@ use std::path::PathBuf;
 use bullet_lib::{
     game::inputs::{ShogiHalfKA, ShogiHalfKA_hm, ShogiHalfKP, SparseInputType},
     nn::optimiser::{self, AdamWParams, RAdamParams, RangerParams},
+    shogi::ShogiDirectSequentialDataLoader,
     trainer::{
         save::SavedFormat,
-        schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
+        schedule::{lr, wdl, TrainingSchedule, TrainingSteps},
         settings::LocalSettings,
     },
-    value::{ValueTrainerBuilder, loader::DirectSequentialDataLoader},
+    value::ValueTrainerBuilder,
 };
 use clap::{Parser, ValueEnum};
 
@@ -232,6 +238,19 @@ struct Args {
     /// Only re-quantise checkpoint (no training, requires --resume)
     #[arg(long)]
     quantise_only: bool,
+
+    /// Random FEN skipping.
+    /// n means on average skip n positions before using one.
+    /// For example, n=3 means use 1 out of every 4 positions (1/(n+1) probability).
+    /// Set to 0 to disable (default).
+    #[arg(long, default_value = "0")]
+    random_fen_skipping: u32,
+
+    /// Early FEN skipping based on ply (move count).
+    /// Positions with ply < n will be skipped.
+    /// Set to 0 to disable (default).
+    #[arg(long, default_value = "0")]
+    early_fen_skipping: u32,
 }
 
 // =============================================================================
@@ -441,13 +460,15 @@ fn main() {
     // Reckless/Stockfish: Pairwise uses QA=255 with CReLU
     // Traditional: CReLU uses QA=127, SCReLU uses QA=255
     let recommended_qa = match (args.activation, pairwise_enabled) {
-        (ActivationType::Screlu, _) => 255,      // SCReLU always uses QA=255
-        (ActivationType::Crelu, true) => 255,    // Pairwise + CReLU uses QA=255 (Reckless compatible)
-        (ActivationType::Crelu, false) => 127,   // Traditional CReLU uses QA=127
+        (ActivationType::Screlu, _) => 255,    // SCReLU always uses QA=255
+        (ActivationType::Crelu, true) => 255,  // Pairwise + CReLU uses QA=255 (Reckless compatible)
+        (ActivationType::Crelu, false) => 127, // Traditional CReLU uses QA=127
     };
     if qa != recommended_qa && !args.quantise_only {
-        eprintln!("WARNING: QA={} is not recommended for {} activation{}.",
-            qa, activation_name,
+        eprintln!(
+            "WARNING: QA={} is not recommended for {} activation{}.",
+            qa,
+            activation_name,
             if pairwise_enabled { " with pairwise" } else { "" }
         );
         eprintln!("         Recommended: --qa {}", recommended_qa);
@@ -479,8 +500,10 @@ fn main() {
     println!("Features: {} ({} dimensions)", feature_name, input_size);
     println!("Architecture: {} (L1={}, L2={}, L3={})", arch.display(), l1_size, l2_size, l3_size);
     if pairwise_enabled {
-        println!("Network: {} -> {}x2 -> pairwise_mul -> {} -> {} -> {} -> 1",
-            input_size, l1_size, l1_input_dim, l2_size, l3_size);
+        println!(
+            "Network: {} -> {}x2 -> pairwise_mul -> {} -> {} -> {} -> 1",
+            input_size, l1_size, l1_input_dim, l2_size, l3_size
+        );
     } else {
         println!("Network: {} -> {}x2 -> {} -> {} -> 1", input_size, l1_size, l2_size, l3_size);
     }
@@ -499,6 +522,8 @@ fn main() {
     println!("Output: {}", args.output.display());
     println!("Net ID: {}", args.net_id);
     println!("Data: {}", args.data);
+    println!("Random fen skipping: {} (use 1/{})", args.random_fen_skipping, args.random_fen_skipping + 1);
+    println!("Early fen skipping: {} (skip ply < {})", args.early_fen_skipping, args.early_fen_skipping);
     println!("===========================");
 
     // Training schedule
@@ -536,7 +561,9 @@ fn main() {
         args.data.split(',').map(|s| s.to_string()).collect()
     };
     let data_files_ref: Vec<&str> = data_files_owned.iter().map(|s| s.as_str()).collect();
-    let data_loader = DirectSequentialDataLoader::new(&data_files_ref);
+    let data_loader = ShogiDirectSequentialDataLoader::new(&data_files_ref)
+        .with_random_fen_skipping(args.random_fen_skipping)
+        .with_early_fen_skipping(args.early_fen_skipping);
 
     // SavedFormat configuration
     // This directly outputs the final format for your engine.
@@ -614,9 +641,7 @@ fn main() {
                     ((qa_i32 * qa_i32) >> shift) * i32::from(qb)
                 }
                 // SCReLU QA=255: x² >> 9 で 127 スケール
-                (ActivationType::Screlu, false, qa) if qa >= 255 => {
-                    127 * i32::from(qb)
-                }
+                (ActivationType::Screlu, false, qa) if qa >= 255 => 127 * i32::from(qb),
                 // CReLU / その他: qa スケール
                 _ => i32::from(qa) * i32::from(qb),
             };
@@ -643,29 +668,41 @@ fn main() {
                 // 入力次元: l1_input_dim → pad32(l1_input_dim)
                 // Pairwise時はl1_size、通常時は2*l1_size
                 SavedFormat::id("l1b").round().quantise::<i32>(l1_bias_scale),
-                SavedFormat::id("l1w").transpose().transform({
-                    let out_dim = l2_size;
-                    let in_dim = l1_input_dim;
-                    move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
-                }).round().quantise::<i8>(qb),
+                SavedFormat::id("l1w")
+                    .transpose()
+                    .transform({
+                        let out_dim = l2_size;
+                        let in_dim = l1_input_dim;
+                        move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
+                    })
+                    .round()
+                    .quantise::<i8>(qb),
                 // L2: biases i32, weights i8 (row-major, padded)
                 // 入力次元: l2 → pad32(l2)
                 // L2入力スケール: crelu_i32_to_u8 後は常に 127 スケール
                 SavedFormat::id("l2b").round().quantise::<i32>(127 * i32::from(qb)),
-                SavedFormat::id("l2w").transpose().transform({
-                    let out_dim = l3_size;
-                    let in_dim = l2_size;
-                    move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
-                }).round().quantise::<i8>(qb),
+                SavedFormat::id("l2w")
+                    .transpose()
+                    .transform({
+                        let out_dim = l3_size;
+                        let in_dim = l2_size;
+                        move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
+                    })
+                    .round()
+                    .quantise::<i8>(qb),
                 // Output: biases i32, weights i8 (row-major, padded)
                 // 入力次元: l3 → pad32(l3)
                 // Output入力スケール: crelu_i32_to_u8 後は常に 127 スケール
                 SavedFormat::id("outb").round().quantise::<i32>(127 * i32::from(qb)),
-                SavedFormat::id("outw").transpose().transform({
-                    let out_dim = 1;
-                    let in_dim = l3_size;
-                    move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
-                }).round().quantise::<i8>(qb),
+                SavedFormat::id("outw")
+                    .transpose()
+                    .transform({
+                        let out_dim = 1;
+                        let in_dim = l3_size;
+                        move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
+                    })
+                    .round()
+                    .quantise::<i8>(qb),
             ]
         }
     };

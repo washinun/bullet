@@ -1,13 +1,13 @@
 use std::{fs::File, sync::mpsc, thread};
 
 use sfbinpack::{
-    CompressedTrainingDataEntryReader, TrainingDataEntry,
     chess::{color::Color, piecetype::PieceType},
+    CompressedTrainingDataEntryReader, TrainingDataEntry,
 };
 
 use crate::game::formats::bulletformat::ChessBoard;
 
-use super::{DataLoader, rng::SimpleRand};
+use super::{rng::SimpleRand, DataLoader};
 
 fn convert_to_bulletformat(entry: &TrainingDataEntry) -> ChessBoard {
     let mut bbs = [0; 8];
