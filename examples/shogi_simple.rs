@@ -26,6 +26,7 @@ Options:
     --output <DIR>      Output directory (default: checkpoints)
     --net-id <NAME>     Network ID (default: shogi-halfka-hm)
     --weight-decay <F>  Weight decay (default: 0.01)
+    --win-rate-model    Use win rate model for score conversion
 
 Examples:
     # Train with default settings
@@ -36,6 +37,9 @@ Examples:
 
     # Train with custom sizes
     cargo run --release --example shogi_simple -- --l1 1024 --l2 16 --l3 64 --data data/train.bin
+
+    # Train with win rate model
+    cargo run --release --example shogi_simple -- --win-rate-model --data data/train.bin
 */
 
 use std::path::PathBuf;
@@ -45,10 +49,10 @@ use bullet_lib::{
     nn::optimiser::{self, AdamWParams, RAdamParams, RangerParams},
     trainer::{
         save::SavedFormat,
-        schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
+        schedule::{lr, wdl, TrainingSchedule, TrainingSteps},
         settings::LocalSettings,
     },
-    value::{ValueTrainerBuilder, loader::DirectSequentialDataLoader},
+    value::{loader::DirectSequentialDataLoader, ValueTrainerBuilder},
 };
 use clap::{Parser, ValueEnum};
 
@@ -233,6 +237,14 @@ struct Args {
     /// Only re-quantise checkpoint (no training, requires --resume)
     #[arg(long)]
     quantise_only: bool,
+
+    /// Use win rate model (score -> win probability conversion)
+    /// When enabled, converts evaluation score using:
+    ///   p = (score - 270.0) / 380.0
+    ///   pm = (-score - 270.0) / 380.0
+    ///   win_rate = 0.5 * (1.0 + sigmoid(p) - sigmoid(pm))
+    #[arg(long)]
+    win_rate_model: bool,
 }
 
 // =============================================================================
@@ -443,13 +455,15 @@ fn main() {
     // Reckless/Stockfish: Pairwise uses QA=255 with CReLU
     // Traditional: CReLU uses QA=127, SCReLU uses QA=255
     let recommended_qa = match (args.activation, pairwise_enabled) {
-        (ActivationType::Screlu, _) => 255,      // SCReLU always uses QA=255
-        (ActivationType::Crelu, true) => 255,    // Pairwise + CReLU uses QA=255 (Reckless compatible)
-        (ActivationType::Crelu, false) => 127,   // Traditional CReLU uses QA=127
+        (ActivationType::Screlu, _) => 255,    // SCReLU always uses QA=255
+        (ActivationType::Crelu, true) => 255,  // Pairwise + CReLU uses QA=255 (Reckless compatible)
+        (ActivationType::Crelu, false) => 127, // Traditional CReLU uses QA=127
     };
     if qa != recommended_qa && !args.quantise_only {
-        eprintln!("WARNING: QA={} is not recommended for {} activation{}.",
-            qa, activation_name,
+        eprintln!(
+            "WARNING: QA={} is not recommended for {} activation{}.",
+            qa,
+            activation_name,
             if pairwise_enabled { " with pairwise" } else { "" }
         );
         eprintln!("         Recommended: --qa {}", recommended_qa);
@@ -481,13 +495,16 @@ fn main() {
     println!("Features: {} ({} dimensions)", feature_name, input_size);
     println!("Architecture: {} (L1={}, L2={}, L3={})", arch.display(), l1_size, l2_size, l3_size);
     if pairwise_enabled {
-        println!("Network: {} -> {}x2 -> pairwise_mul -> {} -> {} -> {} -> 1",
-            input_size, l1_size, l1_input_dim, l2_size, l3_size);
+        println!(
+            "Network: {} -> {}x2 -> pairwise_mul -> {} -> {} -> {} -> 1",
+            input_size, l1_size, l1_input_dim, l2_size, l3_size
+        );
     } else {
         println!("Network: {} -> {}x2 -> {} -> {} -> 1", input_size, l1_size, l2_size, l3_size);
     }
     println!("Activation: {}", activation_name);
     println!("Pairwise: {} (L1 input = {})", pairwise_name, l1_input_dim);
+    println!("Win rate model: {}", if args.win_rate_model { "enabled" } else { "disabled" });
     println!("Optimizer: {}", optimizer_name);
     println!("Weight decay: {}", args.weight_decay);
     println!("Scale: {}", args.scale);
@@ -616,9 +633,7 @@ fn main() {
                     ((qa_i32 * qa_i32) >> shift) * i32::from(qb)
                 }
                 // SCReLU QA=255: x² >> 9 で 127 スケール
-                (ActivationType::Screlu, false, qa) if qa >= 255 => {
-                    127 * i32::from(qb)
-                }
+                (ActivationType::Screlu, false, qa) if qa >= 255 => 127 * i32::from(qb),
                 // CReLU / その他: qa スケール
                 _ => i32::from(qa) * i32::from(qb),
             };
@@ -645,142 +660,166 @@ fn main() {
                 // 入力次元: l1_input_dim → pad32(l1_input_dim)
                 // Pairwise時はl1_size、通常時は2*l1_size
                 SavedFormat::id("l1b").round().quantise::<i32>(l1_bias_scale),
-                SavedFormat::id("l1w").transpose().transform({
-                    let out_dim = l2_size;
-                    let in_dim = l1_input_dim;
-                    move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
-                }).round().quantise::<i8>(qb),
+                SavedFormat::id("l1w")
+                    .transpose()
+                    .transform({
+                        let out_dim = l2_size;
+                        let in_dim = l1_input_dim;
+                        move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
+                    })
+                    .round()
+                    .quantise::<i8>(qb),
                 // L2: biases i32, weights i8 (row-major, padded)
                 // 入力次元: l2 → pad32(l2)
                 // L2入力スケール: crelu_i32_to_u8 後は常に 127 スケール
                 SavedFormat::id("l2b").round().quantise::<i32>(127 * i32::from(qb)),
-                SavedFormat::id("l2w").transpose().transform({
-                    let out_dim = l3_size;
-                    let in_dim = l2_size;
-                    move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
-                }).round().quantise::<i8>(qb),
+                SavedFormat::id("l2w")
+                    .transpose()
+                    .transform({
+                        let out_dim = l3_size;
+                        let in_dim = l2_size;
+                        move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
+                    })
+                    .round()
+                    .quantise::<i8>(qb),
                 // Output: biases i32, weights i8 (row-major, padded)
                 // 入力次元: l3 → pad32(l3)
                 // Output入力スケール: crelu_i32_to_u8 後は常に 127 スケール
                 SavedFormat::id("outb").round().quantise::<i32>(127 * i32::from(qb)),
-                SavedFormat::id("outw").transpose().transform({
-                    let out_dim = 1;
-                    let in_dim = l3_size;
-                    move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
-                }).round().quantise::<i8>(qb),
+                SavedFormat::id("outw")
+                    .transpose()
+                    .transform({
+                        let out_dim = 1;
+                        let in_dim = l3_size;
+                        move |_, vals| pad_weights_for_simd(&vals, out_dim, in_dim)
+                    })
+                    .round()
+                    .quantise::<i8>(qb),
             ]
         }
     };
 
     // Network builder macro with SCReLU activation (no pairwise)
     macro_rules! build_trainer_screlu {
-        ($opt:expr, $input:expr) => {
-            ValueTrainerBuilder::default()
+        ($opt:expr, $input:expr, $use_win_rate:expr) => {{
+            let mut builder = ValueTrainerBuilder::default()
                 .dual_perspective()
                 .optimiser($opt)
                 .inputs($input)
                 .save_format(&save_format)
-                .loss_fn(|output, target| output.sigmoid().squared_error(target))
-                .build(|builder, stm_inputs, ntm_inputs| {
-                    let l0 = builder.new_affine("l0", input_size, l1_size);
-                    let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
-                    let l2 = builder.new_affine("l2", l2_size, l3_size);
-                    let out = builder.new_affine("out", l3_size, 1);
+                .loss_fn(|output, target| output.sigmoid().squared_error(target));
+            if $use_win_rate {
+                builder = builder.use_win_rate_model();
+            }
+            builder.build(|builder, stm_inputs, ntm_inputs| {
+                let l0 = builder.new_affine("l0", input_size, l1_size);
+                let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
+                let l2 = builder.new_affine("l2", l2_size, l3_size);
+                let out = builder.new_affine("out", l3_size, 1);
 
-                    let stm_hidden = l0.forward(stm_inputs).screlu();
-                    let ntm_hidden = l0.forward(ntm_inputs).screlu();
-                    let combined = stm_hidden.concat(ntm_hidden);
+                let stm_hidden = l0.forward(stm_inputs).screlu();
+                let ntm_hidden = l0.forward(ntm_inputs).screlu();
+                let combined = stm_hidden.concat(ntm_hidden);
 
-                    let hidden1 = l1.forward(combined).screlu();
-                    let hidden2 = l2.forward(hidden1).screlu();
+                let hidden1 = l1.forward(combined).screlu();
+                let hidden2 = l2.forward(hidden1).screlu();
 
-                    out.forward(hidden2)
-                })
-        };
+                out.forward(hidden2)
+            })
+        }};
     }
 
     // Network builder macro with SCReLU activation + pairwise multiplication
     macro_rules! build_trainer_screlu_pairwise {
-        ($opt:expr, $input:expr) => {
-            ValueTrainerBuilder::default()
+        ($opt:expr, $input:expr, $use_win_rate:expr) => {{
+            let mut builder = ValueTrainerBuilder::default()
                 .dual_perspective()
                 .optimiser($opt)
                 .inputs($input)
                 .save_format(&save_format)
-                .loss_fn(|output, target| output.sigmoid().squared_error(target))
-                .build(|builder, stm_inputs, ntm_inputs| {
-                    let l0 = builder.new_affine("l0", input_size, l1_size);
-                    let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
-                    let l2 = builder.new_affine("l2", l2_size, l3_size);
-                    let out = builder.new_affine("out", l3_size, 1);
+                .loss_fn(|output, target| output.sigmoid().squared_error(target));
+            if $use_win_rate {
+                builder = builder.use_win_rate_model();
+            }
+            builder.build(|builder, stm_inputs, ntm_inputs| {
+                let l0 = builder.new_affine("l0", input_size, l1_size);
+                let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
+                let l2 = builder.new_affine("l2", l2_size, l3_size);
+                let out = builder.new_affine("out", l3_size, 1);
 
-                    // SCReLU + pairwise_mul (unusual but supported)
-                    let stm_hidden = l0.forward(stm_inputs).screlu().pairwise_mul();
-                    let ntm_hidden = l0.forward(ntm_inputs).screlu().pairwise_mul();
-                    let combined = stm_hidden.concat(ntm_hidden);
+                // SCReLU + pairwise_mul (unusual but supported)
+                let stm_hidden = l0.forward(stm_inputs).screlu().pairwise_mul();
+                let ntm_hidden = l0.forward(ntm_inputs).screlu().pairwise_mul();
+                let combined = stm_hidden.concat(ntm_hidden);
 
-                    let hidden1 = l1.forward(combined).screlu();
-                    let hidden2 = l2.forward(hidden1).screlu();
+                let hidden1 = l1.forward(combined).screlu();
+                let hidden2 = l2.forward(hidden1).screlu();
 
-                    out.forward(hidden2)
-                })
-        };
+                out.forward(hidden2)
+            })
+        }};
     }
 
     // Network builder macro with CReLU (Clipped ReLU) activation (no pairwise)
     macro_rules! build_trainer_crelu {
-        ($opt:expr, $input:expr) => {
-            ValueTrainerBuilder::default()
+        ($opt:expr, $input:expr, $use_win_rate:expr) => {{
+            let mut builder = ValueTrainerBuilder::default()
                 .dual_perspective()
                 .optimiser($opt)
                 .inputs($input)
                 .save_format(&save_format)
-                .loss_fn(|output, target| output.sigmoid().squared_error(target))
-                .build(|builder, stm_inputs, ntm_inputs| {
-                    let l0 = builder.new_affine("l0", input_size, l1_size);
-                    let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
-                    let l2 = builder.new_affine("l2", l2_size, l3_size);
-                    let out = builder.new_affine("out", l3_size, 1);
+                .loss_fn(|output, target| output.sigmoid().squared_error(target));
+            if $use_win_rate {
+                builder = builder.use_win_rate_model();
+            }
+            builder.build(|builder, stm_inputs, ntm_inputs| {
+                let l0 = builder.new_affine("l0", input_size, l1_size);
+                let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
+                let l2 = builder.new_affine("l2", l2_size, l3_size);
+                let out = builder.new_affine("out", l3_size, 1);
 
-                    let stm_hidden = l0.forward(stm_inputs).crelu();
-                    let ntm_hidden = l0.forward(ntm_inputs).crelu();
-                    let combined = stm_hidden.concat(ntm_hidden);
+                let stm_hidden = l0.forward(stm_inputs).crelu();
+                let ntm_hidden = l0.forward(ntm_inputs).crelu();
+                let combined = stm_hidden.concat(ntm_hidden);
 
-                    let hidden1 = l1.forward(combined).crelu();
-                    let hidden2 = l2.forward(hidden1).crelu();
+                let hidden1 = l1.forward(combined).crelu();
+                let hidden2 = l2.forward(hidden1).crelu();
 
-                    out.forward(hidden2)
-                })
-        };
+                out.forward(hidden2)
+            })
+        }};
     }
 
     // Network builder macro with CReLU activation + pairwise multiplication
     // This is the recommended combination for pairwise multiplication
     macro_rules! build_trainer_crelu_pairwise {
-        ($opt:expr, $input:expr) => {
-            ValueTrainerBuilder::default()
+        ($opt:expr, $input:expr, $use_win_rate:expr) => {{
+            let mut builder = ValueTrainerBuilder::default()
                 .dual_perspective()
                 .optimiser($opt)
                 .inputs($input)
                 .save_format(&save_format)
-                .loss_fn(|output, target| output.sigmoid().squared_error(target))
-                .build(|builder, stm_inputs, ntm_inputs| {
-                    let l0 = builder.new_affine("l0", input_size, l1_size);
-                    let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
-                    let l2 = builder.new_affine("l2", l2_size, l3_size);
-                    let out = builder.new_affine("out", l3_size, 1);
+                .loss_fn(|output, target| output.sigmoid().squared_error(target));
+            if $use_win_rate {
+                builder = builder.use_win_rate_model();
+            }
+            builder.build(|builder, stm_inputs, ntm_inputs| {
+                let l0 = builder.new_affine("l0", input_size, l1_size);
+                let l1 = builder.new_affine("l1", l1_input_dim, l2_size);
+                let l2 = builder.new_affine("l2", l2_size, l3_size);
+                let out = builder.new_affine("out", l3_size, 1);
 
-                    // CReLU + pairwise_mul (recommended combination)
-                    let stm_hidden = l0.forward(stm_inputs).crelu().pairwise_mul();
-                    let ntm_hidden = l0.forward(ntm_inputs).crelu().pairwise_mul();
-                    let combined = stm_hidden.concat(ntm_hidden);
+                // CReLU + pairwise_mul (recommended combination)
+                let stm_hidden = l0.forward(stm_inputs).crelu().pairwise_mul();
+                let ntm_hidden = l0.forward(ntm_inputs).crelu().pairwise_mul();
+                let combined = stm_hidden.concat(ntm_hidden);
 
-                    let hidden1 = l1.forward(combined).crelu();
-                    let hidden2 = l2.forward(hidden1).crelu();
+                let hidden1 = l1.forward(combined).crelu();
+                let hidden2 = l2.forward(hidden1).crelu();
 
-                    out.forward(hidden2)
-                })
-        };
+                out.forward(hidden2)
+            })
+        }};
     }
 
     // Helper macro to either run training or just re-quantise
@@ -813,85 +852,85 @@ fn main() {
 
     // Run training macro (to reduce duplication across feature sets, activations, and pairwise)
     macro_rules! run_training {
-        ($input:expr, screlu, false) => {{
+        ($input:expr, screlu, false, $win_rate:expr) => {{
             let weight_decay = args.weight_decay;
             match args.optimizer {
                 OptimizerType::AdamW => {
-                    let mut trainer = build_trainer_screlu!(optimiser::AdamW, $input);
+                    let mut trainer = build_trainer_screlu!(optimiser::AdamW, $input, $win_rate);
                     trainer.optimiser.set_params(AdamWParams { decay: weight_decay, ..Default::default() });
                     maybe_run_or_quantise!(trainer);
                 }
                 OptimizerType::RAdam => {
-                    let mut trainer = build_trainer_screlu!(optimiser::RAdam, $input);
+                    let mut trainer = build_trainer_screlu!(optimiser::RAdam, $input, $win_rate);
                     let params: RAdamParams = RAdamParams { decay: weight_decay, ..Default::default() };
                     trainer.optimiser.set_params(params.into());
                     maybe_run_or_quantise!(trainer);
                 }
                 OptimizerType::Ranger => {
-                    let mut trainer = build_trainer_screlu!(optimiser::Ranger, $input);
+                    let mut trainer = build_trainer_screlu!(optimiser::Ranger, $input, $win_rate);
                     trainer.optimiser.set_params(RangerParams { decay: weight_decay, ..Default::default() });
                     maybe_run_or_quantise!(trainer);
                 }
             }
         }};
-        ($input:expr, screlu, true) => {{
+        ($input:expr, screlu, true, $win_rate:expr) => {{
             let weight_decay = args.weight_decay;
             match args.optimizer {
                 OptimizerType::AdamW => {
-                    let mut trainer = build_trainer_screlu_pairwise!(optimiser::AdamW, $input);
+                    let mut trainer = build_trainer_screlu_pairwise!(optimiser::AdamW, $input, $win_rate);
                     trainer.optimiser.set_params(AdamWParams { decay: weight_decay, ..Default::default() });
                     maybe_run_or_quantise!(trainer);
                 }
                 OptimizerType::RAdam => {
-                    let mut trainer = build_trainer_screlu_pairwise!(optimiser::RAdam, $input);
+                    let mut trainer = build_trainer_screlu_pairwise!(optimiser::RAdam, $input, $win_rate);
                     let params: RAdamParams = RAdamParams { decay: weight_decay, ..Default::default() };
                     trainer.optimiser.set_params(params.into());
                     maybe_run_or_quantise!(trainer);
                 }
                 OptimizerType::Ranger => {
-                    let mut trainer = build_trainer_screlu_pairwise!(optimiser::Ranger, $input);
+                    let mut trainer = build_trainer_screlu_pairwise!(optimiser::Ranger, $input, $win_rate);
                     trainer.optimiser.set_params(RangerParams { decay: weight_decay, ..Default::default() });
                     maybe_run_or_quantise!(trainer);
                 }
             }
         }};
-        ($input:expr, crelu, false) => {{
+        ($input:expr, crelu, false, $win_rate:expr) => {{
             let weight_decay = args.weight_decay;
             match args.optimizer {
                 OptimizerType::AdamW => {
-                    let mut trainer = build_trainer_crelu!(optimiser::AdamW, $input);
+                    let mut trainer = build_trainer_crelu!(optimiser::AdamW, $input, $win_rate);
                     trainer.optimiser.set_params(AdamWParams { decay: weight_decay, ..Default::default() });
                     maybe_run_or_quantise!(trainer);
                 }
                 OptimizerType::RAdam => {
-                    let mut trainer = build_trainer_crelu!(optimiser::RAdam, $input);
+                    let mut trainer = build_trainer_crelu!(optimiser::RAdam, $input, $win_rate);
                     let params: RAdamParams = RAdamParams { decay: weight_decay, ..Default::default() };
                     trainer.optimiser.set_params(params.into());
                     maybe_run_or_quantise!(trainer);
                 }
                 OptimizerType::Ranger => {
-                    let mut trainer = build_trainer_crelu!(optimiser::Ranger, $input);
+                    let mut trainer = build_trainer_crelu!(optimiser::Ranger, $input, $win_rate);
                     trainer.optimiser.set_params(RangerParams { decay: weight_decay, ..Default::default() });
                     maybe_run_or_quantise!(trainer);
                 }
             }
         }};
-        ($input:expr, crelu, true) => {{
+        ($input:expr, crelu, true, $win_rate:expr) => {{
             let weight_decay = args.weight_decay;
             match args.optimizer {
                 OptimizerType::AdamW => {
-                    let mut trainer = build_trainer_crelu_pairwise!(optimiser::AdamW, $input);
+                    let mut trainer = build_trainer_crelu_pairwise!(optimiser::AdamW, $input, $win_rate);
                     trainer.optimiser.set_params(AdamWParams { decay: weight_decay, ..Default::default() });
                     maybe_run_or_quantise!(trainer);
                 }
                 OptimizerType::RAdam => {
-                    let mut trainer = build_trainer_crelu_pairwise!(optimiser::RAdam, $input);
+                    let mut trainer = build_trainer_crelu_pairwise!(optimiser::RAdam, $input, $win_rate);
                     let params: RAdamParams = RAdamParams { decay: weight_decay, ..Default::default() };
                     trainer.optimiser.set_params(params.into());
                     maybe_run_or_quantise!(trainer);
                 }
                 OptimizerType::Ranger => {
-                    let mut trainer = build_trainer_crelu_pairwise!(optimiser::Ranger, $input);
+                    let mut trainer = build_trainer_crelu_pairwise!(optimiser::Ranger, $input, $win_rate);
                     trainer.optimiser.set_params(RangerParams { decay: weight_decay, ..Default::default() });
                     maybe_run_or_quantise!(trainer);
                 }
@@ -900,19 +939,44 @@ fn main() {
     }
 
     // Run training based on feature set, activation, and pairwise mode
+    let use_win_rate_model = args.win_rate_model;
     match (args.features, args.activation, pairwise_enabled) {
-        (FeatureSet::HalfkaHm, ActivationType::Screlu, false) => run_training!(ShogiHalfKA_hm, screlu, false),
-        (FeatureSet::HalfkaHm, ActivationType::Screlu, true) => run_training!(ShogiHalfKA_hm, screlu, true),
-        (FeatureSet::HalfkaHm, ActivationType::Crelu, false) => run_training!(ShogiHalfKA_hm, crelu, false),
-        (FeatureSet::HalfkaHm, ActivationType::Crelu, true) => run_training!(ShogiHalfKA_hm, crelu, true),
-        (FeatureSet::Halfka, ActivationType::Screlu, false) => run_training!(ShogiHalfKA, screlu, false),
-        (FeatureSet::Halfka, ActivationType::Screlu, true) => run_training!(ShogiHalfKA, screlu, true),
-        (FeatureSet::Halfka, ActivationType::Crelu, false) => run_training!(ShogiHalfKA, crelu, false),
-        (FeatureSet::Halfka, ActivationType::Crelu, true) => run_training!(ShogiHalfKA, crelu, true),
-        (FeatureSet::HalfKP, ActivationType::Screlu, false) => run_training!(ShogiHalfKP, screlu, false),
-        (FeatureSet::HalfKP, ActivationType::Screlu, true) => run_training!(ShogiHalfKP, screlu, true),
-        (FeatureSet::HalfKP, ActivationType::Crelu, false) => run_training!(ShogiHalfKP, crelu, false),
-        (FeatureSet::HalfKP, ActivationType::Crelu, true) => run_training!(ShogiHalfKP, crelu, true),
+        (FeatureSet::HalfkaHm, ActivationType::Screlu, false) => {
+            run_training!(ShogiHalfKA_hm, screlu, false, use_win_rate_model)
+        }
+        (FeatureSet::HalfkaHm, ActivationType::Screlu, true) => {
+            run_training!(ShogiHalfKA_hm, screlu, true, use_win_rate_model)
+        }
+        (FeatureSet::HalfkaHm, ActivationType::Crelu, false) => {
+            run_training!(ShogiHalfKA_hm, crelu, false, use_win_rate_model)
+        }
+        (FeatureSet::HalfkaHm, ActivationType::Crelu, true) => {
+            run_training!(ShogiHalfKA_hm, crelu, true, use_win_rate_model)
+        }
+        (FeatureSet::Halfka, ActivationType::Screlu, false) => {
+            run_training!(ShogiHalfKA, screlu, false, use_win_rate_model)
+        }
+        (FeatureSet::Halfka, ActivationType::Screlu, true) => {
+            run_training!(ShogiHalfKA, screlu, true, use_win_rate_model)
+        }
+        (FeatureSet::Halfka, ActivationType::Crelu, false) => {
+            run_training!(ShogiHalfKA, crelu, false, use_win_rate_model)
+        }
+        (FeatureSet::Halfka, ActivationType::Crelu, true) => {
+            run_training!(ShogiHalfKA, crelu, true, use_win_rate_model)
+        }
+        (FeatureSet::HalfKP, ActivationType::Screlu, false) => {
+            run_training!(ShogiHalfKP, screlu, false, use_win_rate_model)
+        }
+        (FeatureSet::HalfKP, ActivationType::Screlu, true) => {
+            run_training!(ShogiHalfKP, screlu, true, use_win_rate_model)
+        }
+        (FeatureSet::HalfKP, ActivationType::Crelu, false) => {
+            run_training!(ShogiHalfKP, crelu, false, use_win_rate_model)
+        }
+        (FeatureSet::HalfKP, ActivationType::Crelu, true) => {
+            run_training!(ShogiHalfKP, crelu, true, use_win_rate_model)
+        }
     }
 }
 
