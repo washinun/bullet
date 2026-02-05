@@ -1,66 +1,21 @@
 use std::marker::PhantomData;
 
 use acyclib::{
-    device::{tensor::Shape, Device},
+    device::{Device, tensor::Shape},
     graph::save::SavedFormat,
-    trainer::{optimiser::Optimiser, Trainer},
+    trainer::{Trainer, optimiser::Optimiser},
 };
 
 use crate::{
     game::{inputs::SparseInputType, outputs::OutputBuckets},
-    nn::{optimiser::OptimiserType, BackendMarker, ExecutionContext, NetworkBuilder, NetworkBuilderNode},
+    nn::{BackendMarker, ExecutionContext, NetworkBuilder, NetworkBuilderNode, optimiser::OptimiserType},
     value::ValueTrainerState,
 };
 
-use super::{ValueTrainer, B};
-
-/// Constants for NNUE loss calculation (from nnue-pytorch)
-mod nnue_constants {
-    /// Conversion factor from NNUE output to centipawn score
-    pub const NNUE2SCORE: f32 = 600.0;
-    /// Score scaling factor for normalization
-    pub const SCORE_SCALING: f32 = 511.0;
-}
+use super::{B, ValueTrainer};
 
 type Wgt<I> = fn(&<I as SparseInputType>::RequiredDataType) -> f32;
 type LossFn = for<'a> fn(Nbn<'a>, Nbn<'a>) -> Nbn<'a>;
-
-/// NNUE loss function (YaneuraOu-style with per-sample WDL)
-///
-/// This loss function implements a simplified version of the nnue-pytorch loss
-/// with separate score and outcome targets, and per-sample WDL values.
-///
-/// # Arguments
-/// * `output` - Network output (single value per position)
-/// * `targets` - 3-channel tensor [score_winrate, outcome, wdl]
-///   - score_winrate: Win rate from evaluation score using YaneuraOu model
-///   - outcome: Game result (0.0=loss, 0.5=draw, 1.0=win)
-///   - wdl: WDL lambda value for blending (0.0=score only, 1.0=outcome only)
-///
-/// # Calculation
-/// 1. Convert output to score: q = output * 600 / 511
-/// 2. Apply sigmoid to get win probability
-/// 3. Blend score and outcome targets with per-sample wdl value
-/// 4. Compute squared error loss
-fn nnue_loss<'a>(output: Nbn<'a>, targets: Nbn<'a>) -> Nbn<'a> {
-    use nnue_constants::*;
-
-    // Split 3-channel targets into score, outcome, and wdl components
-    let score_target = targets.slice_rows(0, 1);
-    let outcome_target = targets.slice_rows(1, 2);
-    let wdl_value = targets.slice_rows(2, 3);
-
-    // Convert network output to centipawn score and apply sigmoid
-    let q = output * (NNUE2SCORE / SCORE_SCALING);
-    let q_sigmoid = q.sigmoid();
-
-    // Blend score-based and outcome-based targets with per-sample wdl value
-    // wdl = 0.0: use score only, wdl = 1.0: use outcome only
-    let blended_target = score_target * (1.0 - wdl_value) + outcome_target * wdl_value;
-
-    // Compute squared error between predicted and blended target
-    q_sigmoid.squared_error(blended_target)
-}
 
 pub struct ValueTrainerBuilder<O, I: SparseInputType, P, Out> {
     input_getter: Option<I>,
@@ -74,7 +29,6 @@ pub struct ValueTrainerBuilder<O, I: SparseInputType, P, Out> {
     factorised: Vec<String>,
     wdl_output: bool,
     use_win_rate_model: bool,
-    use_nnue_loss: bool,
     print_ir: bool,
     device_ids: Vec<<ExecutionContext as Device>::IdType>,
 }
@@ -95,7 +49,6 @@ where
             loss_fn: None,
             wdl_output: false,
             use_win_rate_model: false,
-            use_nnue_loss: false,
             factorised: Vec::new(),
             print_ir: false,
             device_ids: Vec::new(),
@@ -134,15 +87,6 @@ where
     pub fn loss_fn(mut self, f: LossFn) -> Self {
         assert!(self.loss_fn.is_none(), "Loss function already set!");
         self.loss_fn = Some(f);
-        self
-    }
-
-    /// Use NNUE loss function (YaneuraOu-style with per-sample WDL)
-    /// This requires 3-channel targets: [score_winrate, outcome, wdl]
-    pub fn nnue_loss_fn(mut self) -> Self {
-        assert!(self.loss_fn.is_none(), "Loss function already set!");
-        self.loss_fn = Some(nnue_loss);
-        self.use_nnue_loss = true;
         self
     }
 
@@ -212,13 +156,7 @@ where
 
         let mut builder = NetworkBuilder::default();
 
-        let output_size = if self.wdl_output {
-            3
-        } else if self.use_nnue_loss {
-            3 // 3 channels: [score_winrate, outcome, wdl]
-        } else {
-            1
-        };
+        let output_size = if self.wdl_output { 3 } else { 1 };
         let targets = builder.new_dense_input("targets", Shape::new(output_size, 1));
         let (out, loss) = f(inputs, nnz, targets, &builder);
 
@@ -255,7 +193,6 @@ where
                 output_node,
                 use_win_rate_model: self.use_win_rate_model,
                 wdl: self.wdl_output,
-                use_nnue_loss: self.use_nnue_loss,
                 saved_format,
             },
         })
@@ -340,7 +277,6 @@ where
             factorised: self.factorised,
             wdl_output: self.wdl_output,
             use_win_rate_model: self.use_win_rate_model,
-            use_nnue_loss: self.use_nnue_loss,
             print_ir: self.print_ir,
             device_ids: self.device_ids,
         }
@@ -370,7 +306,6 @@ where
             factorised: self.factorised,
             wdl_output: self.wdl_output,
             use_win_rate_model: self.use_win_rate_model,
-            use_nnue_loss: self.use_nnue_loss,
             print_ir: self.print_ir,
             device_ids: self.device_ids,
         }

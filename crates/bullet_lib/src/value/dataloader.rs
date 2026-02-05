@@ -1,10 +1,7 @@
-use acyclib::{
-    device::tensor::Shape,
-    trainer::{
-        dataloader::{DataLoader, HostDenseMatrix, HostMatrix, HostSparseMatrix, PreparedBatchHost},
-        schedule::TrainingSteps,
-        DataLoadingError,
-    },
+use acyclib::trainer::{
+    DataLoadingError,
+    dataloader::{DataLoader, HostDenseMatrix, HostMatrix, HostSparseMatrix, PreparedBatchHost},
+    schedule::TrainingSteps,
 };
 
 use crate::{
@@ -24,7 +21,6 @@ where
     pub steps: TrainingSteps,
     pub threads: usize,
     pub wdl: W,
-    pub use_nnue_loss: bool,
 }
 
 impl<I, O, D, W> DataLoader for ValueDataLoader<I, O, D, W>
@@ -42,7 +38,7 @@ where
         batch_size: usize,
         mut f: F,
     ) -> Result<(), DataLoadingError> {
-        let ValueDataLoader { dataloader, steps, threads, wdl, use_nnue_loss } = self;
+        let ValueDataLoader { dataloader, steps, threads, wdl } = self;
         let start_batch = steps.batches_per_superbatch * (steps.start_superbatch - 1);
 
         assert_eq!(batch_size, steps.batch_size);
@@ -51,12 +47,8 @@ where
         let mut superbatch = 1;
 
         dataloader.load_and_map_batches(start_batch, batch_size, |batch| {
-            let wdl_value = wdl.blend(batch_no, superbatch, steps.end_superbatch);
-            let prepared_data = if use_nnue_loss {
-                dataloader.prepare_nnue(batch, threads, wdl_value)
-            } else {
-                dataloader.prepare(batch, threads, wdl_value)
-            };
+            let blend = wdl.blend(batch_no, superbatch, steps.end_superbatch);
+            let prepared_data = dataloader.prepare(batch, threads, blend);
 
             batch_no += 1;
 
@@ -92,16 +84,9 @@ impl<I: SparseInputType, O> From<PreparedData<I, O>> for PreparedBatchHost {
             let _ = host_data.inputs.insert("buckets".to_string(), HostMatrix::Sparse(buckets));
         }
 
-        // If NNUE loss targets are present, use the 3-channel target [score, outcome, wdl]
-        if let Some(nnue_targets_3ch) = prepared_data.nnue_targets {
-            // nnue_targets_3ch already contains [score, outcome, wdl] for each sample
-            let targets = HostDenseMatrix::new(nnue_targets_3ch.value, Some(batch_size), Shape::new(3, 1));
-            let _ = host_data.inputs.insert("targets".to_string(), HostMatrix::Dense(targets));
-        } else {
-            let DenseInput { value, shape } = prepared_data.targets;
-            let targets = HostDenseMatrix::new(value, Some(batch_size), shape);
-            let _ = host_data.inputs.insert("targets".to_string(), HostMatrix::Dense(targets));
-        }
+        let DenseInput { value, shape } = prepared_data.targets;
+        let targets = HostDenseMatrix::new(value, Some(batch_size), shape);
+        let _ = host_data.inputs.insert("targets".to_string(), HostMatrix::Dense(targets));
 
         let DenseInput { value, shape } = prepared_data.weights;
         let weights = HostDenseMatrix::new(value, Some(batch_size), shape);
