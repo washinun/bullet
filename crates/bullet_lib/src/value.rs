@@ -9,11 +9,11 @@ pub use builder::{NoOutputBuckets, ValueTrainerBuilder};
 
 use acyclib::{
     graph::Node,
-    trainer::{self, Trainer, logger, optimiser::OptimiserState},
+    trainer::{self, logger, optimiser::OptimiserState, Trainer},
 };
 
 use acyclib::{
-    graph::{GraphNodeId, GraphNodeIdTy, like::GraphLike, save::SavedFormat},
+    graph::{like::GraphLike, save::SavedFormat, GraphNodeId, GraphNodeIdTy},
     trainer::dataloader::{PreparedBatchDevice, PreparedBatchHost},
 };
 
@@ -21,7 +21,7 @@ use crate::{
     game::{inputs::SparseInputType, outputs::OutputBuckets},
     nn::{ExecutionContext, Graph},
     trainer::{
-        schedule::{TrainingSchedule, lr::LrScheduler, wdl::WdlScheduler},
+        schedule::{lr::LrScheduler, wdl::WdlScheduler, TrainingSchedule},
         settings::LocalSettings,
     },
     value::{
@@ -76,6 +76,7 @@ pub struct ValueTrainerState<Inp: SparseInputType, Out> {
     saved_format: Vec<SavedFormat>,
     use_win_rate_model: bool,
     wdl: bool,
+    use_nnue_loss: bool,
 }
 
 impl<Inp: SparseInputType, Out> ValueTrainerState<Inp, Out>
@@ -84,25 +85,31 @@ where
     Inp::RequiredDataType: LoadableDataType,
     Out: OutputBuckets<Inp::RequiredDataType>,
 {
-    pub fn prepare(
-        &self,
-        batch: &[Inp::RequiredDataType],
-        threads: usize,
-        blend: f32,
-        scale: f32,
-    ) -> PreparedBatchHost {
-        PreparedBatchHost::from(PreparedData::new(
-            self.input_getter.clone(),
-            self.output_getter,
-            self.blend_getter,
-            self.weight_getter,
-            self.use_win_rate_model,
-            self.wdl,
-            batch,
-            threads,
-            blend,
-            scale,
-        ))
+    pub fn prepare(&self, batch: &[Inp::RequiredDataType], threads: usize, wdl: f32, scale: f32) -> PreparedBatchHost {
+        if self.use_nnue_loss {
+            PreparedBatchHost::from(PreparedData::new_nnue(
+                self.input_getter.clone(),
+                self.output_getter,
+                self.weight_getter,
+                batch,
+                threads,
+                scale,
+                wdl,
+            ))
+        } else {
+            PreparedBatchHost::from(PreparedData::new(
+                self.input_getter.clone(),
+                self.output_getter,
+                self.blend_getter,
+                self.weight_getter,
+                self.use_win_rate_model,
+                self.wdl,
+                batch,
+                threads,
+                wdl,
+                scale,
+            ))
+        }
     }
 }
 
@@ -148,6 +155,7 @@ where
         let lr_scheduler = schedule.lr_scheduler.clone();
 
         let steps = schedule.steps;
+        let use_nnue_loss = self.state.use_nnue_loss;
 
         let error_record = RefCell::new(Vec::new());
         let mut loss_sum = 0.0;
@@ -159,7 +167,13 @@ where
                 log_rate: 128,
                 lr_schedule: Box::new(|a, b| lr_scheduler.lr(a, b)),
             },
-            ValueDataLoader { steps, threads: settings.threads, dataloader, wdl: schedule.wdl_scheduler.clone() },
+            ValueDataLoader {
+                steps,
+                threads: settings.threads,
+                dataloader,
+                wdl: schedule.wdl_scheduler.clone(),
+                use_nnue_loss,
+            },
             |_, superbatch, curr_batch, error| {
                 loss_sum += error;
                 ticks_since_last += 1.0;
@@ -255,6 +269,7 @@ where
         let steps = schedule.steps;
         let threads = settings.threads;
         let wdl = schedule.wdl_scheduler.clone();
+        let use_nnue_loss = self.state.use_nnue_loss;
         let dataloader = DefaultDataLoader::new(
             self.state.input_getter.clone(),
             self.state.output_getter,
@@ -266,7 +281,7 @@ where
             dataloader.clone(),
         );
 
-        let dataloader = ValueDataLoader { steps, threads, dataloader, wdl };
+        let dataloader = ValueDataLoader { steps, threads, dataloader, wdl, use_nnue_loss };
 
         self.0.measure_max_cpu_throughput(dataloader, steps).unwrap()
     }
