@@ -552,7 +552,7 @@ fn main() {
             end_superbatch: args.superbatches,
         },
         wdl_scheduler: wdl::ConstantWDL { value: args.wdl },
-        lr_scheduler: lr::StepLR { start: args.lr, gamma: 0.3, step: 30 },
+        lr_scheduler: lr::StepLR { start: args.lr, gamma: 0.992, step: 1 },
         save_rate: args.save_rate,
     };
 
