@@ -6,11 +6,11 @@ use std::{
 
 use crate::game::formats::bulletformat::ChessBoard;
 
-use super::{DataLoader, rng::SimpleRand};
+use super::{rng::SimpleRand, DataLoader};
 
 use montyformat::{
-    FastDeserialise, MontyValueFormat,
     chess::{Move, Position},
+    FastDeserialise, MontyValueFormat,
 };
 
 #[derive(Clone)]
@@ -58,19 +58,17 @@ where
         let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(256);
         let (msg_sender, msg_receiver) = mpsc::sync_channel::<bool>(1);
 
-        std::thread::spawn(move || {
-            'dataloading: loop {
-                for file_path in &file_paths {
-                    let mut reader = BufReader::new(File::open(file_path.as_str()).unwrap());
+        std::thread::spawn(move || 'dataloading: loop {
+            for file_path in &file_paths {
+                let mut reader = BufReader::new(File::open(file_path.as_str()).unwrap());
 
-                    let mut buffer = Vec::new();
-                    while let Ok(()) = MontyValueFormat::deserialise_fast_into_buffer(&mut reader, &mut buffer) {
-                        if msg_receiver.try_recv().unwrap_or(false) || sender.send(buffer).is_err() {
-                            break 'dataloading;
-                        }
-
-                        buffer = Vec::new();
+                let mut buffer = Vec::new();
+                while let Ok(()) = MontyValueFormat::deserialise_fast_into_buffer(&mut reader, &mut buffer) {
+                    if msg_receiver.try_recv().unwrap_or(false) || sender.send(buffer).is_err() {
+                        break 'dataloading;
                     }
+
+                    buffer = Vec::new();
                 }
             }
         });
