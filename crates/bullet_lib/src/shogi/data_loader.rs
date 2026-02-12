@@ -236,28 +236,23 @@ impl DataLoader<PackedSfenValue> for ShogiDirectSequentialDataLoader {
                 }
             }
 
-            // After processing all files, check if we have remaining pending positions
-            // and need to loop back to read more data
+            // After processing all files, we need to loop back to the beginning
+            // to continue providing data for training (infinite loop design).
+            // This ensures continuous data supply regardless of skipping settings.
+
+            // Reset file paths to start from the beginning for the next iteration
+            file_paths = self.file_paths.clone();
+
+            // If skipping is enabled and we have pending positions,
+            // try to emit full batches before continuing
             if skipping_enabled && !pending.is_empty() {
-                // We have some pending positions but not enough for a full batch
-                // and we've reached the end of all files.
-                // In this case, we continue the loop to read from the beginning again.
-                // This ensures we maintain the target number of positions per epoch.
-
-                // Rotate files back to start for the next iteration
-                file_paths = self.file_paths.clone();
-
-                // Emit any full batches that might have accumulated
                 if Self::emit_batches(&mut pending, batch_size, &mut f) {
                     break 'dataloading;
                 }
-
-                // Continue reading from the beginning to fill the batch
-                continue;
             }
 
-            // No skipping or no pending data, we're done with this epoch
-            break;
+            // Continue reading from the beginning (infinite loop)
+            continue;
         }
 
         // Emit any remaining pending positions as a final partial batch
