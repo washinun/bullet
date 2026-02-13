@@ -150,11 +150,7 @@ impl<T: CanBeDirectlySequentiallyLoaded> DataLoader<T> for DirectSequentialDataL
                                 .collect();
 
                             // Only pass non-empty batches
-                            if filtered.is_empty() {
-                                false
-                            } else {
-                                f(&filtered)
-                            }
+                            if filtered.is_empty() { false } else { f(&filtered) }
                         } else {
                             f(batch)
                         };
