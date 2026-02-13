@@ -16,7 +16,11 @@ Options:
     --lr <RATE>         Initial learning rate (default: 0.001)
     --lr-gamma <F>      Learning rate gamma (default: 0.992)
     --lr-step <N>       Learning rate decay step in superbatches (default: 1)
-    --wdl <LAMBDA>      WDL lambda (default: 0.75)
+    --wdl <LAMBDA>      WDL lambda for constant scheduler (default: 0.5)
+                        Cannot be used with --start-wdl/--end-wdl
+    --start-wdl <F>     Start WDL lambda for linear interpolation
+    --end-wdl <F>       End WDL lambda for linear interpolation
+                        Must use both --start-wdl and --end-wdl together
     --scale <N>         Eval scale (default: 1016)
                         FV_SCALE = QA*QB/scale (rounded)
                         QA=127 (CReLU):  8128/scale  -> 508->16, 254->32, 1016->8
@@ -47,6 +51,9 @@ Examples:
 
     # Train with random fen skipping (use 1/4 of positions) and skip first 16 plies
     cargo run --release --example shogi_simple -- --data data/train.bin --random-fen-skipping 3 --early-fen-skipping 16
+
+    # Train with linear WDL (start at 0.2, end at 0.8)
+    cargo run --release --example shogi_simple -- --data data/train.bin --start-wdl 0.2 --end-wdl 0.8
 */
 
 use std::path::PathBuf;
@@ -57,7 +64,7 @@ use bullet_lib::{
     shogi::ShogiDirectSequentialDataLoader,
     trainer::{
         save::SavedFormat,
-        schedule::{lr, wdl, TrainingSchedule, TrainingSteps},
+        schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
         settings::LocalSettings,
     },
     value::ValueTrainerBuilder,
@@ -196,8 +203,19 @@ struct Args {
     lr: f32,
 
     /// WDL lambda (0.0=eval only, 1.0=game result only)
+    /// Cannot be used with --start-wdl and --end-wdl
     #[arg(long, default_value = "0.5")]
     wdl: f32,
+
+    /// Start WDL lambda for linear interpolation
+    /// Must be used together with --end-wdl
+    #[arg(long)]
+    start_wdl: Option<f32>,
+
+    /// End WDL lambda for linear interpolation
+    /// Must be used together with --start-wdl
+    #[arg(long)]
+    end_wdl: Option<f32>,
 
     /// Eval scale for training target sigmoid(score / scale).
     /// FV_SCALE = QA*QB/scale (rounded).
@@ -276,6 +294,35 @@ struct Args {
     /// LR is decayed every N superbatches.
     #[arg(long, default_value = "1")]
     lr_step: usize,
+}
+
+impl Args {
+    /// Validates WDL-related arguments and creates the appropriate scheduler.
+    /// Returns error if arguments are invalid.
+    fn create_wdl_scheduler(&self) -> Result<wdl::WdlSchedulerEnum, String> {
+        match (self.start_wdl, self.end_wdl) {
+            (Some(start), Some(end)) => {
+                if self.wdl != 0.5 {
+                    return Err("Cannot use both --wdl and --start-wdl/--end-wdl\n\
+                         Use either --wdl <value> for constant WDL,\n\
+                         or --start-wdl <value> --end-wdl <value> for linear WDL"
+                        .to_string());
+                }
+                Ok(wdl::WdlSchedulerEnum::linear(start, end))
+            }
+            (Some(_), None) => Err("--start-wdl requires --end-wdl".to_string()),
+            (None, Some(_)) => Err("--end-wdl requires --start-wdl".to_string()),
+            (None, None) => Ok(wdl::WdlSchedulerEnum::constant(self.wdl)),
+        }
+    }
+
+    /// Returns a display string for the WDL configuration.
+    fn wdl_display(&self) -> String {
+        match (self.start_wdl, self.end_wdl) {
+            (Some(start), Some(end)) => format!("Linear ({} -> {})", start, end),
+            _ => format!("Constant ({})", self.wdl),
+        }
+    }
 }
 
 // =============================================================================
@@ -379,15 +426,15 @@ fn build_nnue_description(feature_set: FeatureSet, l1_size: usize, l2_size: usiz
         feature_name,
         input_size,
         l1_size,
-        l3_size,  // Output layer input
-        l3_size,  // L2 output / L3 input
-        l3_size,  // L2 output features
-        l2_size,  // L2 input features
-        l2_size,  // L1 output / L2 input
-        l2_size,  // L1 output features
-        l1_size * 2,  // L1 input (accumulator x2)
-        l1_size * 2,  // InputSlice size
-        l1_size * 2   // InputSlice range
+        l3_size,     // Output layer input
+        l3_size,     // L2 output / L3 input
+        l3_size,     // L2 output features
+        l2_size,     // L2 input features
+        l2_size,     // L1 output / L2 input
+        l2_size,     // L1 output features
+        l1_size * 2, // L1 input (accumulator x2)
+        l1_size * 2, // InputSlice size
+        l1_size * 2  // InputSlice range
     );
 
     description
@@ -543,7 +590,7 @@ fn main() {
     println!("Batch size: {}", args.batch_size);
     println!("Superbatches: {}", args.superbatches);
     println!("Learning rate: {}", args.lr);
-    println!("WDL lambda: {}", args.wdl);
+    println!("WDL lambda: {}", args.wdl_display());
     println!("Save rate: {}", args.save_rate);
     println!("Threads: {}", args.threads);
     println!("Output: {}", args.output.display());
@@ -552,6 +599,12 @@ fn main() {
     println!("Random fen skipping: {} (use 1/{})", args.random_fen_skipping, args.random_fen_skipping + 1);
     println!("Early fen skipping: {} (skip ply < {})", args.early_fen_skipping, args.early_fen_skipping);
     println!("===========================");
+
+    // Create WDL scheduler
+    let wdl_scheduler = args.create_wdl_scheduler().unwrap_or_else(|e| {
+        eprintln!("ERROR: {}", e);
+        std::process::exit(1);
+    });
 
     // Training schedule
     let schedule = TrainingSchedule {
@@ -563,7 +616,7 @@ fn main() {
             start_superbatch: 1,
             end_superbatch: args.superbatches,
         },
-        wdl_scheduler: wdl::ConstantWDL { value: args.wdl },
+        wdl_scheduler,
         lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
         save_rate: args.save_rate,
     };
