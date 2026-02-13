@@ -14,6 +14,8 @@ Options:
     --batch-size <N>    Batch size (default: 16384)
     --superbatches <N>  Number of superbatches (default: 100)
     --lr <RATE>         Initial learning rate (default: 0.001)
+    --lr-gamma <F>      Learning rate gamma (default: 0.992)
+    --lr-step <N>       Learning rate decay step in superbatches (default: 1)
     --wdl <LAMBDA>      WDL lambda (default: 0.75)
     --scale <N>         Eval scale (default: 1016)
                         FV_SCALE = QA*QB/scale (rounded)
@@ -42,7 +44,7 @@ Examples:
 
     # Train with win rate model
     cargo run --release --example shogi_simple -- --win-rate-model --data data/train.bin
-    
+
     # Train with random fen skipping (use 1/4 of positions) and skip first 16 plies
     cargo run --release --example shogi_simple -- --data data/train.bin --random-fen-skipping 3 --early-fen-skipping 16
 */
@@ -251,7 +253,7 @@ struct Args {
     ///   win_rate = 0.5 * (1.0 + sigmoid(p) - sigmoid(pm))
     #[arg(long)]
     win_rate_model: bool,
-  
+
     /// Random FEN skipping.
     /// n means on average skip n positions before using one.
     /// For example, n=3 means use 1 out of every 4 positions (1/(n+1) probability).
@@ -264,6 +266,16 @@ struct Args {
     /// Set to 0 to disable (default).
     #[arg(long, default_value = "0")]
     early_fen_skipping: u32,
+
+    /// Learning rate gamma (decay factor per step).
+    /// Applied as: lr = lr * gamma^floor(superbatch/step)
+    #[arg(long, default_value = "0.992")]
+    lr_gamma: f32,
+
+    /// Learning rate decay step (superbatches).
+    /// LR is decayed every N superbatches.
+    #[arg(long, default_value = "1")]
+    lr_step: usize,
 }
 
 // =============================================================================
@@ -552,7 +564,7 @@ fn main() {
             end_superbatch: args.superbatches,
         },
         wdl_scheduler: wdl::ConstantWDL { value: args.wdl },
-        lr_scheduler: lr::StepLR { start: args.lr, gamma: 0.992, step: 1 },
+        lr_scheduler: lr::StepLR { start: args.lr, gamma: args.lr_gamma, step: args.lr_step },
         save_rate: args.save_rate,
     };
 
