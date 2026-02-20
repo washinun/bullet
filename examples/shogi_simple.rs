@@ -33,8 +33,6 @@ Options:
     --net-id <NAME>     Network ID (default: shogi-halfka-hm)
     --weight-decay <F>  Weight decay (default: 0.01)
     --win-rate-model    Use win rate model for score conversion
-    --random-fen-skipping <N>    Skip fens randomly, use 1 of every (N+1) positions (default: 0)
-    --early-fen-skipping <N>     Skip positions with ply < N (default: 0)
 
 Examples:
     # Train with default settings
@@ -49,9 +47,6 @@ Examples:
     # Train with win rate model
     cargo run --release --example shogi_simple -- --win-rate-model --data data/train.bin
 
-    # Train with random fen skipping (use 1/4 of positions) and skip first 16 plies
-    cargo run --release --example shogi_simple -- --data data/train.bin --random-fen-skipping 3 --early-fen-skipping 16
-
     # Train with linear WDL (start at 0.2, end at 0.8)
     cargo run --release --example shogi_simple -- --data data/train.bin --start-wdl 0.2 --end-wdl 0.8
 */
@@ -61,13 +56,12 @@ use std::path::PathBuf;
 use bullet_lib::{
     game::inputs::{ShogiHalfKA, ShogiHalfKA_hm, ShogiHalfKP, SparseInputType},
     nn::optimiser::{self, AdamWParams, RAdamParams, RangerParams},
-    shogi::ShogiDirectSequentialDataLoader,
     trainer::{
         save::SavedFormat,
         schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
         settings::LocalSettings,
     },
-    value::ValueTrainerBuilder,
+    value::{ValueTrainerBuilder, loader::DirectSequentialDataLoader},
 };
 use clap::{Parser, ValueEnum};
 
@@ -271,19 +265,6 @@ struct Args {
     ///   win_rate = 0.5 * (1.0 + sigmoid(p) - sigmoid(pm))
     #[arg(long)]
     win_rate_model: bool,
-
-    /// Random FEN skipping.
-    /// n means on average skip n positions before using one.
-    /// For example, n=3 means use 1 out of every 4 positions (1/(n+1) probability).
-    /// Set to 0 to disable (default).
-    #[arg(long, default_value = "0")]
-    random_fen_skipping: u32,
-
-    /// Early FEN skipping based on ply (move count).
-    /// Positions with ply < n will be skipped.
-    /// Set to 0 to disable (default).
-    #[arg(long, default_value = "0")]
-    early_fen_skipping: u32,
 
     /// Learning rate gamma (decay factor per step).
     /// Applied as: lr = lr * gamma^floor(superbatch/step)
@@ -596,8 +577,6 @@ fn main() {
     println!("Output: {}", args.output.display());
     println!("Net ID: {}", args.net_id);
     println!("Data: {}", args.data);
-    println!("Random fen skipping: {} (use 1/{})", args.random_fen_skipping, args.random_fen_skipping + 1);
-    println!("Early fen skipping: {} (skip ply < {})", args.early_fen_skipping, args.early_fen_skipping);
     println!("===========================");
 
     // Create WDL scheduler
@@ -641,9 +620,7 @@ fn main() {
         args.data.split(',').map(|s| s.to_string()).collect()
     };
     let data_files_ref: Vec<&str> = data_files_owned.iter().map(|s| s.as_str()).collect();
-    let data_loader = ShogiDirectSequentialDataLoader::new(&data_files_ref)
-        .with_random_fen_skipping(args.random_fen_skipping)
-        .with_early_fen_skipping(args.early_fen_skipping);
+    let data_loader = DirectSequentialDataLoader::new(&data_files_ref);
 
     // SavedFormat configuration
     // This directly outputs the final format for your engine.
