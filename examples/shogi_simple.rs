@@ -12,6 +12,7 @@ Options:
     --l3 <SIZE>         L3 (hidden layer 2) size
     --data <PATH>       Training data path (comma-separated for multiple files)
     --batch-size <N>    Batch size (default: 16384)
+    --batches_per_superbatch <N>  Batches per superbatch (default: 6104, ~100M positions/superbatch)
     --superbatches <N>  Number of superbatches (default: 100)
     --lr <RATE>         Initial learning rate (default: 0.001)
     --lr-gamma <F>      Learning rate gamma (default: 0.992)
@@ -187,6 +188,10 @@ struct Args {
     /// Batch size
     #[arg(long, default_value = "16384")]
     batch_size: usize,
+
+    /// Batches Per Superbatch
+    #[arg(long, default_value = "6104")]
+    batches_per_superbatch: usize,
 
     /// Number of superbatches
     #[arg(long, default_value = "100")]
@@ -569,6 +574,7 @@ fn main() {
     println!("Scale: {}", args.scale);
     println!("Quantization: QA={}, QB={}", qa, qb);
     println!("Batch size: {}", args.batch_size);
+    println!("Batches Per Superbatch: {}", args.batches_per_superbatch);
     println!("Superbatches: {}", args.superbatches);
     println!("Learning rate: {}", args.lr);
     println!("WDL lambda: {}", args.wdl_display());
@@ -591,7 +597,7 @@ fn main() {
         eval_scale: args.scale as f32,
         steps: TrainingSteps {
             batch_size: args.batch_size,
-            batches_per_superbatch: 6104, // ~100M positions/superbatch
+            batches_per_superbatch: args.batches_per_superbatch,
             start_superbatch: 1,
             end_superbatch: args.superbatches,
         },
