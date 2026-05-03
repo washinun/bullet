@@ -23,8 +23,8 @@ use crate::shogi::{
 // 定数
 // =============================================================================
 
-/// nnue-pytorch互換の特徴量hash値 (HalfKA_hm)
-pub const FEATURE_HASH_HM: u32 = 0x5f134cb8;
+/// nnue-pytorch互換の特徴量hash値 (HalfKA_hm_v2)
+pub const FEATURE_HASH_HM_V2: u32 = 0x7f134cb8;
 
 /// キングバケット数 (Half-Mirror: 9段 × 5筋)
 pub const NUM_KING_BUCKETS: usize = 45;
@@ -227,7 +227,7 @@ fn map_halfka_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F) {
 /// 9段:    8   17   26   35   44
 /// ```
 #[inline]
-fn king_bucket(ksq: Square, perspective: Color) -> usize {
+pub(crate) fn king_bucket(ksq: Square, perspective: Color) -> usize {
     // 視点に応じてマスを変換（後手視点では盤面を180度回転）
     let sq = if perspective == Color::Black { ksq } else { ksq.inverse() };
 
@@ -245,7 +245,7 @@ fn king_bucket(ksq: Square, perspective: Color) -> usize {
 ///
 /// 玉のファイルが 5 以上 (6筋-9筋) の場合に true。
 #[inline]
-fn is_hm_mirror(ksq: Square, perspective: Color) -> bool {
+pub(crate) fn is_hm_mirror(ksq: Square, perspective: Color) -> bool {
     let sq = if perspective == Color::Black { ksq } else { ksq.inverse() };
     sq.file() as usize >= 5
 }
@@ -260,7 +260,7 @@ fn is_hm_mirror(ksq: Square, perspective: Color) -> bool {
 /// 2. 盤上駒 (>=90): hm_mirror が必要な場合はマス目を反転
 /// 3. 敵王 (>=e_king): -81 して f_king 平面に揃える
 #[inline]
-fn pack_bonapiece(bp: BonaPiece, hm_mirror: bool) -> usize {
+pub(crate) fn pack_bonapiece(bp: BonaPiece, hm_mirror: bool) -> usize {
     let mut pp = bp.value() as usize;
 
     // 手駒はミラー不要
@@ -291,14 +291,14 @@ fn pack_bonapiece(bp: BonaPiece, hm_mirror: bool) -> usize {
 ///
 /// HalfKA_hm では両方の王を特徴量に含める。
 #[inline]
-fn king_bonapiece(sq_index: usize, is_friend: bool) -> BonaPiece {
+pub(crate) fn king_bonapiece(sq_index: usize, is_friend: bool) -> BonaPiece {
     let base = if is_friend { F_KING } else { E_KING };
     BonaPiece::new((base as usize + sq_index) as u16)
 }
 
 /// HalfKA_hm の特徴インデックスを計算
 #[inline]
-fn halfka_index(kb: usize, packed_bp: usize) -> usize {
+pub(crate) fn halfka_index(kb: usize, packed_bp: usize) -> usize {
     kb * PIECE_INPUTS + packed_bp
 }
 
@@ -590,12 +590,12 @@ mod tests {
     #[test]
     fn test_map_features_count() {
         // ダミーの局面を作成（手動で設定）
-        let mut board = ShogiBoard::default();
-        board.side_to_move = Color::Black;
-
-        // 玉を配置
-        board.black_king_sq = Square::new(4, 8); // 5九
-        board.white_king_sq = Square::new(4, 0); // 5一
+        let mut board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: Square::new(4, 8), // 5九
+            white_king_sq: Square::new(4, 0), // 5一
+            ..Default::default()
+        };
         board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
         board.board[board.white_king_sq.index()] = Piece::new(Color::White, PieceType::King);
 
@@ -615,12 +615,12 @@ mod tests {
     #[test]
     fn test_map_features_sq_nb_guard() {
         // 片玉データ（玉位置が SQ_NB=81）のテスト
-        let mut board = ShogiBoard::default();
-        board.side_to_move = Color::Black;
-
-        // 先手玉を正常位置、後手玉を SQ_NB(81) に設定
-        board.black_king_sq = Square::new(4, 8); // 5九
-        board.white_king_sq = Square::NONE; // SQ_NB (81)
+        let mut board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: Square::new(4, 8), // 5九
+            white_king_sq: Square::NONE,      // SQ_NB (81)
+            ..Default::default()
+        };
         board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
 
         let mut count = 0;
@@ -691,12 +691,12 @@ mod tests {
 
     #[test]
     fn test_map_halfka_nonmirror_features_count() {
-        let mut board = ShogiBoard::default();
-        board.side_to_move = Color::Black;
-
-        // 玉を配置
-        board.black_king_sq = Square::new(4, 8); // 5九
-        board.white_king_sq = Square::new(4, 0); // 5一
+        let mut board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: Square::new(4, 8), // 5九
+            white_king_sq: Square::new(4, 0), // 5一
+            ..Default::default()
+        };
         board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
         board.board[board.white_king_sq.index()] = Piece::new(Color::White, PieceType::King);
 
