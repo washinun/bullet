@@ -1,47 +1,30 @@
 [package]
 name = "bullet_lib"
 version = "1.0.0"
-description = "Neural Network Trainer"
 authors = { workspace = true }
 license = { workspace = true }
 repository = { workspace = true }
 readme = { workspace = true }
 rust-version = { workspace = true }
 edition = { workspace = true }
-
-[features]
-default = ["cuda"]
-cpu = []
-cuda = ["bullet_cuda_backend"]
-hip = ["bullet_hip_backend", "bullet_hip_backend/hip", "bullet_cuda_backend?/error"]
-hip-cuda = ["bullet_hip_backend"]
-multigpu = ["bullet_cuda_backend/nccl"]
-# Threat profile gate. canonical test を除外するために使う build-time フラグ。
-# 通常の build では無効 (= canonical test 有効)。
-threat-profile-same-class = []
-threat-profile-same-class-major-pawn = []
+description = "Neural Network Trainer"
 
 [dependencies]
-acyclib = { workspace = true }
-bullet_cuda_backend = { workspace = true, optional = true }
-bullet_hip_backend = { workspace = true, optional = true }
-bulletformat = { workspace = true }
-montyformat = { workspace = true }
+bullet-compiler = { workspace = true }
+bullet-gpu = { workspace = true }
+bullet-trainer = { workspace = true }
+bulletformat = "1.8.0"
+montyformat = "0.9.2"
 sfbinpack = "0.6.0"
-viriformat = { workspace = true }
+viriformat = "2.0.1"
 
-[dev-dependencies]
-clap = { workspace = true }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+[features]
+cuda = ["bullet-gpu/cuda", "bullet-trainer/cuda"]
+rocm = ["bullet-gpu/rocm", "bullet-trainer/rocm"]
 
 [[example]]
 name = "simple"
 path = "../../examples/simple.rs"
-
-[[example]]
-name = "mnist"
-path = "../../examples/extra/mnist.rs"
 
 [[example]]
 name = "test1"
@@ -70,51 +53,3 @@ path = "../../examples/progression/3_input_buckets.rs"
 [[example]]
 name = "4_multi_layer"
 path = "../../examples/progression/4_multi_layer.rs"
-
-[[example]]
-name = "relabel"
-path = "../../examples/extra/relabel.rs"
-
-[[example]]
-name = "shogi_simple"
-path = "../../examples/shogi_simple.rs"
-
-[[example]]
-name = "shogi_layerstack"
-path = "../../examples/shogi_layerstack.rs"
-
-[[example]]
-name = "shogi_layerstack_eval"
-path = "../../examples/shogi_layerstack_eval.rs"
-
-[[example]]
-name = "shogi_bucket_survey"
-path = "../../examples/shogi_bucket_survey.rs"
-
-[[example]]
-name = "shogi_progress_kpabs_train"
-path = "../../examples/shogi_progress_kpabs_train.rs"
-
-[[example]]
-name = "compare_progress_buckets"
-path = "../../examples/compare_progress_buckets.rs"
-
-[[example]]
-name = "merge_scores"
-path = "../../examples/merge_scores.rs"
-
-[[example]]
-name = "compilation"
-path = "../../examples/extra/compilation.rs"
-
-[[example]]
-name = "custom_pass"
-path = "../../examples/extra/custom_pass.rs"
-
-[[example]]
-name = "scan_bad_records"
-path = "../../examples/scan_bad_records.rs"
-
-[[example]]
-name = "recover_experiment"
-path = "../../examples/recover_experiment.rs"

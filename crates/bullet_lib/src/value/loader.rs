@@ -1,19 +1,16 @@
 mod direct;
 mod montybinpack;
 mod rng;
-mod sfbinpack;
-pub mod shogipack;
+pub mod sfbinpack;
 mod text;
 pub mod viribinpack;
 
 pub use direct::{CanBeDirectlySequentiallyLoaded, DirectSequentialDataLoader};
 pub use montybinpack::MontyBinpackLoader;
 pub use sfbinpack::SfBinpackLoader;
-pub use shogipack::ShogiPackLoader;
 pub use text::InMemoryTextLoader;
-pub use viribinpack::ViriBinpackLoader;
+pub use viribinpack::{ViriBinpackLoader, ViriFilter};
 
-use acyclib::device::tensor::Shape;
 use bulletformat::BulletFormat;
 
 use crate::game::{inputs::SparseInputType, outputs::OutputBuckets};
@@ -59,7 +56,7 @@ pub trait DataLoader<T>: Clone + Send + Sync + 'static {
         None
     }
 
-    fn map_batches<F: FnMut(&[T]) -> bool>(&self, start_batch: usize, batch_size: usize, f: F);
+    fn map_chunks<F: FnMut(&[T]) -> bool>(&self, start_position: usize, f: F);
 }
 
 pub(crate) type B<I> = fn(&<I as SparseInputType>::RequiredDataType, f32) -> f32;
@@ -103,9 +100,46 @@ where
         &self,
         start_batch: usize,
         batch_size: usize,
-        f: F,
+        mut f: F,
     ) {
-        self.loader.map_batches(start_batch, batch_size, f);
+        let mut incomplete_buf = Vec::new();
+
+        self.loader.map_chunks(start_batch * batch_size, |chunk| {
+            let remainder = if !incomplete_buf.is_empty() {
+                let remainder = batch_size - incomplete_buf.len();
+
+                if chunk.len() >= remainder {
+                    incomplete_buf.extend_from_slice(&chunk[..remainder]);
+                    let should_break = f(&incomplete_buf);
+                    incomplete_buf.clear();
+
+                    if should_break {
+                        return true;
+                    }
+                } else {
+                    incomplete_buf.extend_from_slice(chunk);
+                }
+
+                remainder
+            } else {
+                0
+            };
+
+            if chunk.len() >= remainder {
+                let chunks = chunk[remainder..chunk.len()].chunks_exact(batch_size);
+                incomplete_buf.extend_from_slice(chunks.remainder());
+
+                for batch in chunks {
+                    let should_break = f(batch);
+
+                    if should_break {
+                        return true;
+                    }
+                }
+            }
+
+            false
+        });
     }
 
     pub fn prepare(&self, data: &[I::RequiredDataType], threads: usize, blend: f32) -> PreparedData<I, O> {
@@ -124,30 +158,16 @@ where
     }
 }
 
-pub(crate) struct DenseInput {
-    pub value: Vec<f32>,
-    pub shape: Shape,
-}
-
-#[derive(Clone)]
-pub(crate) struct SparseInput {
-    pub value: Vec<i32>,
-    pub max_active: usize,
-    pub shape: Shape,
-}
-
 /// A batch of data, in the correct format for the GPU.
 pub struct PreparedData<I: SparseInputType, O> {
     pub(crate) input_getter: I,
     pub(crate) output_getter: O,
     pub(crate) batch_size: usize,
-    pub(crate) stm: SparseInput,
-    pub(crate) nstm: SparseInput,
-    pub(crate) buckets: SparseInput,
-    pub(crate) targets: DenseInput,
-    pub(crate) weights: DenseInput,
-    /// HandCount dense auxiliary input。`I::hand_count_dims()` が `Some` のとき設定される。
-    pub(crate) hand_count: Option<DenseInput>,
+    pub(crate) stm: Vec<i32>,
+    pub(crate) nstm: Vec<i32>,
+    pub(crate) buckets: Vec<i32>,
+    pub(crate) targets: Vec<f32>,
+    pub(crate) weights: Vec<f32>,
 }
 
 impl<I, O> PreparedData<I, O>
@@ -176,98 +196,57 @@ where
         let input_size = input_getter.num_inputs();
         let output_size = if wdl { 3 } else { 1 };
         let sparse_size = max_active * batch_size;
-        let hand_count_dims = input_getter.hand_count_dims();
-
-        let hand_count_init =
-            hand_count_dims.map(|dims| DenseInput { value: vec![0.0; dims * batch_size], shape: Shape::new(dims, 1) });
 
         let mut prep = Self {
             input_getter,
             output_getter,
             batch_size,
-            stm: SparseInput { max_active, value: vec![0; sparse_size], shape: Shape::new(input_size, 1) },
-            nstm: SparseInput { max_active, value: vec![0; sparse_size], shape: Shape::new(input_size, 1) },
-            buckets: SparseInput { max_active: 1, value: vec![0; batch_size], shape: Shape::new(O::BUCKETS, 1) },
-            targets: DenseInput { value: vec![0.0; output_size * batch_size], shape: Shape::new(output_size, 1) },
-            weights: DenseInput { value: vec![0.0; batch_size], shape: Shape::new(1, 1) },
-            hand_count: hand_count_init,
+            stm: vec![0; sparse_size],
+            nstm: vec![0; sparse_size],
+            buckets: vec![0; batch_size],
+            targets: vec![0.0; output_size * batch_size],
+            weights: vec![0.0; batch_size],
         };
 
         let sparse_chunk_size = max_active * chunk_size;
 
-        // HandCount 用の並列チャンクを事前に materialise。Option は並列ループ内で扱う。
-        let hand_count_dim = hand_count_dims.unwrap_or(0);
-        let hand_count_chunk_size = hand_count_dim * chunk_size;
-        let num_chunks = batch_size.div_ceil(chunk_size);
-        let hand_count_slices: Vec<Option<&mut [f32]>> = if let Some(hc) = prep.hand_count.as_mut() {
-            hc.value.chunks_mut(hand_count_chunk_size).map(Some).collect()
-        } else {
-            (0..num_chunks).map(|_| None).collect()
-        };
-
         std::thread::scope(|s| {
             data.chunks(chunk_size)
-                .zip(prep.stm.value.chunks_mut(sparse_chunk_size))
-                .zip(prep.nstm.value.chunks_mut(sparse_chunk_size))
-                .zip(prep.buckets.value.chunks_mut(chunk_size))
-                .zip(prep.targets.value.chunks_mut(output_size * chunk_size))
-                .zip(prep.weights.value.chunks_mut(chunk_size))
-                .zip(hand_count_slices)
+                .zip(prep.stm.chunks_mut(sparse_chunk_size))
+                .zip(prep.nstm.chunks_mut(sparse_chunk_size))
+                .zip(prep.buckets.chunks_mut(chunk_size))
+                .zip(prep.targets.chunks_mut(output_size * chunk_size))
+                .zip(prep.weights.chunks_mut(chunk_size))
                 .for_each(
-                    |(
-                        (((((data_chunk, stm_chunk), nstm_chunk), buckets_chunk), results_chunk), weights_chunk),
-                        hand_count_chunk,
-                    )| {
+                    |(((((data_chunk, stm_chunk), nstm_chunk), buckets_chunk), results_chunk), weights_chunk)| {
                         let inp = &prep.input_getter;
                         let out = &prep.output_getter;
                         s.spawn(move || {
                             let chunk_len = data_chunk.len();
-                            let mut hand_count_chunk = hand_count_chunk;
 
                             for i in 0..chunk_len {
                                 let pos = &data_chunk[i];
-
-                                if let Some(hc_slice) = hand_count_chunk.as_deref_mut() {
-                                    let offset = hand_count_dim * i;
-                                    let end = offset + hand_count_dim;
-                                    // 事前に 0 で埋め済み。fill_hand_count は
-                                    // 書き込みのみで読まないので再初期化は不要。
-                                    inp.fill_hand_count(pos, &mut hc_slice[offset..end]);
-                                }
-                                // STM と NSTM は独立カウンタで管理: 非対称 feature
-                                // (HandThreat defensive 等) で |STM_active| != |NSTM_active|
-                                // を許可するため。symmetric な input type は
-                                // map_features_split の default impl 経由で
-                                // 両側同時に進むので従来挙動と一致する。
-                                let mut j_stm: usize = 0;
-                                let mut j_nstm: usize = 0;
+                                let mut j = 0;
                                 let sparse_offset = max_active * i;
 
-                                inp.map_features_split(pos, |our_opt, opp_opt| {
-                                    if let Some(our) = our_opt {
-                                        assert!(our < input_size, "STM feature index exceeded input size!");
-                                        stm_chunk[sparse_offset + j_stm] = our as i32;
-                                        j_stm += 1;
-                                    }
-                                    if let Some(opp) = opp_opt {
-                                        assert!(opp < input_size, "NSTM feature index exceeded input size!");
-                                        nstm_chunk[sparse_offset + j_nstm] = opp as i32;
-                                        j_nstm += 1;
-                                    }
+                                inp.map_features(pos, |our, opp| {
+                                    assert!(
+                                        our < input_size && opp < input_size,
+                                        "Input feature index exceeded input size!"
+                                    );
+
+                                    stm_chunk[sparse_offset + j] = our as i32;
+                                    nstm_chunk[sparse_offset + j] = opp as i32;
+
+                                    j += 1;
                                 });
 
-                                // STM / NSTM の未使用スロットを -1 で埋める (独立)
-                                for j in j_stm..max_active {
+                                for j in j..max_active {
                                     stm_chunk[sparse_offset + j] = -1;
-                                }
-                                for j in j_nstm..max_active {
                                     nstm_chunk[sparse_offset + j] = -1;
                                 }
 
-                                assert!(
-                                    j_stm <= max_active && j_nstm <= max_active,
-                                    "More inputs provided than the specified maximum!"
-                                );
+                                assert!(j <= max_active, "More inputs provided than the specified maximum!");
 
                                 buckets_chunk[i] = i32::from(out.bucket(pos));
                                 weights_chunk[i] = weight_getter.map_or(1.0, |w| w(pos));
