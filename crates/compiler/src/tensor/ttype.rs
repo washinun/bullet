@@ -429,4 +429,8 @@ impl TValue {
     pub fn f32(&self) -> &[f32] {
         if let Self::F32(x) = self { x } else { panic!("Incorrect DType!") }
     }
+
+    pub fn i32(&self) -> &[i32] {
+        if let Self::I32(x) = self { x } else { panic!("Incorrect DType!") }
+    }
 }

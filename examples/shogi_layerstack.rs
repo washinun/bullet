@@ -50,7 +50,7 @@ use bullet_lib::{
         ShogiLayerStackBucket9, ShogiProgressBucket8, ShogiProgressBucket8GikouLite, ShogiProgressKPAbs,
     },
     nn::{
-        Affine, BackendMarker, InitSettings, NetworkBuilderNode, Shape,
+        Affine, InitSettings, ModelNode, Shape,
         optimiser::{self, AdamWParams, RAdamParams, RangerParams},
     },
     trainer::{
@@ -924,31 +924,31 @@ impl ExperimentContext {
             Err(_) => return,
         };
 
-        if let Some(id) = existing.get("id").and_then(|v| v.as_str()) {
+        if let Some(id) = existing.get("id").and_then(|v: &serde_json::Value| v.as_str()) {
             if !id.is_empty() {
                 println!("Inheriting experiment id from {}: {}", json_path.display(), id);
                 self.experiment_id = id.to_string();
             }
         }
-        if let Some(date) = existing.get("date").and_then(|v| v.as_str()) {
+        if let Some(date) = existing.get("date").and_then(|v: &serde_json::Value| v.as_str()) {
             if !date.is_empty() {
                 self.experiment_date = date.to_string();
             }
         }
         if let Some(secs) =
-            existing.get("results").and_then(|v| v.get("training_time_seconds")).and_then(|v| v.as_u64())
+            existing.get("results").and_then(|v: &serde_json::Value| v.get("training_time_seconds")).and_then(|v: &serde_json::Value| v.as_u64())
         {
             if secs > 0 {
                 println!("Inheriting prior training time: {} seconds", secs);
                 self.prior_training_seconds = secs;
             }
         }
-        if let Some(arr) = existing.get("history").and_then(|v| v.as_array()) {
+        if let Some(arr) = existing.get("history").and_then(|v: &serde_json::Value| v.as_array()) {
             let mut history: Vec<LossEntry> = arr
                 .iter()
-                .filter_map(|entry| {
-                    let sb = entry.get("superbatch").and_then(|v| v.as_u64())? as usize;
-                    let loss = entry.get("loss").and_then(|v| v.as_f64())?;
+                .filter_map(|entry: &serde_json::Value| {
+                    let sb = entry.get("superbatch").and_then(|v: &serde_json::Value| v.as_u64())? as usize;
+                    let loss = entry.get("loss").and_then(|v: &serde_json::Value| v.as_f64())?;
                     Some(LossEntry { superbatch: sb, loss })
                 })
                 .collect();
@@ -1152,7 +1152,7 @@ fn build_layerstack_save_format(
         .transform(move |graph, _| {
             let l0b = graph.get("l0b");
             let qa_f = qa_i16 as f64;
-            let biases_i16: Vec<i16> = l0b.values.iter().map(|&v| (qa_f * v as f64).round() as i16).collect();
+            let biases_i16: Vec<i16> = l0b.values.f32().iter().map(|&v| (qa_f * v as f64).round() as i16).collect();
             let leb128_bytes = encode_leb128_tensor_i16(&biases_i16);
             leb128_bytes.iter().map(|&b| (b as i8) as f32).collect()
         })
@@ -1166,12 +1166,12 @@ fn build_layerstack_save_format(
 
             // Quantise to i16 (scale = QA = 127)
             // Threat 有効時は最初の halfka_dim 特徴量のみ（piece 部分）を書き出す。
-            // column-major: l0w.values[feat * ft_out + out]
+            // column-major: l0w[feat * ft_out + out]
             // piece 部分 = feat 0..halfka_dim → indices 0..halfka_dim*ft_out
             let qa_f = qa_i16 as f64;
             let piece_end = halfka_dim_captured * ft_out_captured;
             let weights_i16: Vec<i16> =
-                l0w.values[..piece_end].iter().map(|&v| (qa_f * v as f64).round() as i16).collect();
+                l0w.values.f32()[..piece_end].iter().map(|&v| (qa_f * v as f64).round() as i16).collect();
             let _ = input_size_captured;
             let leb128_bytes = encode_leb128_tensor_i16(&weights_i16);
             leb128_bytes.iter().map(|&b| (b as i8) as f32).collect()
@@ -1193,7 +1193,7 @@ fn build_layerstack_save_format(
 
                     // Biases: i32[9]
                     for bucket in 0..NUM_BUCKETS {
-                        let val = (scale * psqt_b.values[bucket] as f64).round() as i32;
+                        let val = (scale * psqt_b.values.f32()[bucket] as f64).round() as i32;
                         bytes.extend_from_slice(&val.to_le_bytes());
                     }
 
@@ -1201,7 +1201,7 @@ fn build_layerstack_save_format(
                     for feat in 0..input_size_for_psqt {
                         for bucket in 0..NUM_BUCKETS {
                             // column-major: feat * rows + bucket
-                            let w = psqt_w.values[feat * NUM_BUCKETS + bucket];
+                            let w = psqt_w.values.f32()[feat * NUM_BUCKETS + bucket];
                             let val = (scale * w as f64).round() as i32;
                             bytes.extend_from_slice(&val.to_le_bytes());
                         }
@@ -1233,7 +1233,7 @@ fn build_layerstack_save_format(
                     // column-major: indices halfka_dim*ft_out .. input_size*ft_out
                     let threat_start = halfka_dim_for_threat * ft_out_for_threat;
                     let mut bytes: Vec<u8> = Vec::new();
-                    for &v in &l0w.values[threat_start..] {
+                    for &v in &l0w.values.f32()[threat_start..] {
                         let q = (qa_f * v as f64).round().clamp(-128.0, 127.0) as i8;
                         bytes.push(q as u8);
                     }
@@ -1262,7 +1262,7 @@ fn build_layerstack_save_format(
 
                     let ht_start = halfka_dim_for_ht * ft_out_for_ht;
                     let mut bytes: Vec<u8> = Vec::new();
-                    for &v in &l0w.values[ht_start..] {
+                    for &v in &l0w.values.f32()[ht_start..] {
                         let q = (qa_f * v as f64).round().clamp(-128.0, 127.0) as i8;
                         bytes.push(q as u8);
                     }
@@ -1321,7 +1321,7 @@ fn build_layerstack_save_format(
                 // Biases: i32, scale = QA * QB = 8128
                 for out_idx in 0..l1_out_captured {
                     let global_out = bucket * l1_out_captured + out_idx;
-                    let merged_bias = l1b.values[global_out] + l1fb.values[out_idx];
+                    let merged_bias = l1b.values.f32()[global_out] + l1fb.values.f32()[out_idx];
                     let val = (bias_scale_f * merged_bias as f64).round() as i32;
                     output_bytes.extend_from_slice(&val.to_le_bytes());
                 }
@@ -1346,14 +1346,14 @@ fn build_layerstack_save_format(
                             // column-major indexing:
                             //   l1w  shape [NUM_BUCKETS*l1_out, ft_out + hc] -> in * rows + out
                             //   l1fw shape [l1_out, ft_out]                  -> in * l1_out + out
-                            let bucket_w = l1w.values[in_idx * l1_rows_total + global_out];
-                            let shared_w = l1fw.values[in_idx * l1_out_captured + out_idx];
+                            let bucket_w = l1w.values.f32()[in_idx * l1_rows_total + global_out];
+                            let shared_w = l1fw.values.f32()[in_idx * l1_out_captured + out_idx];
                             let w = bucket_w + shared_w;
                             let q = (qb_f * w as f64).round() as i8;
                             output_bytes.push(q as u8);
                         } else if in_idx < l1_total_in {
                             // HandCount Dense 部: bucket_w のみ（共有なし）
-                            let bucket_w = l1w.values[in_idx * l1_rows_total + global_out];
+                            let bucket_w = l1w.values.f32()[in_idx * l1_rows_total + global_out];
                             let q = (qb_f * bucket_w as f64).round() as i8;
                             output_bytes.push(q as u8);
                         } else {
@@ -1367,7 +1367,7 @@ fn build_layerstack_save_format(
                 let l2_bias_scale = 127.0 * qb_f;
                 for out_idx in 0..l2_out_captured {
                     let global_out = bucket * l2_out_captured + out_idx;
-                    let val = (l2_bias_scale * l2b.values[global_out] as f64).round() as i32;
+                    let val = (l2_bias_scale * l2b.values.f32()[global_out] as f64).round() as i32;
                     output_bytes.extend_from_slice(&val.to_le_bytes());
                 }
 
@@ -1379,7 +1379,7 @@ fn build_layerstack_save_format(
                     for in_idx in 0..l2_padded_in {
                         if in_idx < l2_in_captured {
                             // l2w shape [NUM_BUCKETS*l2_out, l2_in], column-major
-                            let w = l2w.values[in_idx * l2_rows_total + global_out];
+                            let w = l2w.values.f32()[in_idx * l2_rows_total + global_out];
                             let q = (qb_f * w as f64).round() as i8;
                             output_bytes.push(q as u8);
                         } else {
@@ -1393,7 +1393,7 @@ fn build_layerstack_save_format(
                 let out_bias_scale = 127.0 * qb_f;
                 {
                     let global_out = bucket;
-                    let val = (out_bias_scale * l3b.values[global_out] as f64).round() as i32;
+                    let val = (out_bias_scale * l3b.values.f32()[global_out] as f64).round() as i32;
                     output_bytes.extend_from_slice(&val.to_le_bytes());
                 }
 
@@ -1404,7 +1404,7 @@ fn build_layerstack_save_format(
                     for in_idx in 0..output_padded_in {
                         if in_idx < l2_out_captured {
                             // l3w shape [NUM_BUCKETS, l2_out], column-major
-                            let w = l3w.values[in_idx * NUM_BUCKETS + global_out];
+                            let w = l3w.values.f32()[in_idx * NUM_BUCKETS + global_out];
                             let q = (qb_f * w as f64).round() as i8;
                             output_bytes.push(q as u8);
                         } else {
@@ -1703,13 +1703,7 @@ fn main() {
         args.data.split(',').map(|s| s.to_string()).collect()
     };
     let data_files_ref: Vec<&str> = data_files_owned.iter().map(|s| s.as_str()).collect();
-    let mut data_loader = DirectSequentialDataLoader::new(&data_files_ref);
-    if let Some(interleave_batches) = args.interleave_batches_value() {
-        data_loader = data_loader.with_interleave_batches(interleave_batches);
-    }
-    if args.epoch_file_shuffle {
-        data_loader = data_loader.with_epoch_file_shuffle(true, args.file_shuffle_seed);
-    }
+    let data_loader = DirectSequentialDataLoader::new(&data_files_ref);
 
     // SavedFormat
     // HandThreat block: full pair と defensive は quantised.bin 上の layout が同一
@@ -1753,7 +1747,7 @@ fn main() {
         },
     };
 
-    type Nbn<'a> = NetworkBuilderNode<'a, BackendMarker>;
+    type Nbn<'a> = ModelNode<'a>;
 
     /// Loss function: WRM applied to network output (nodchip style).
     fn loss_fn_wrm<'a>(output: Nbn<'a>, target: Nbn<'a>) -> Nbn<'a> {
@@ -1761,7 +1755,8 @@ fn main() {
             *WRM_LOSS_PARAMS.get().expect("WRM loss parameters must be initialized before building the trainer");
         let offset = 270.0f32;
         let scorenet = output * params.nnue2score;
-        let q = ((scorenet.copy() - offset) / params.in_scaling).sigmoid();
+        let scorenet_clone = scorenet.clone();
+        let q = ((scorenet_clone - offset) / params.in_scaling).sigmoid();
         let qm = ((-scorenet - offset) / params.in_scaling).sigmoid();
         let qf = (1.0 + q - qm) * 0.5;
         qf.squared_error(target)
